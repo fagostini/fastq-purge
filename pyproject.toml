@@ -15,6 +15,7 @@ dependencies = [
     "loky>=3.5.3",
     "maturin>=1.8.3",
     "multiprocess>=0.70.18",
+    "polars>=1.30.0",
     "psutil>=7.0.0",
     "rbloom>=1.5.2",
     "rich>=14.0.0",

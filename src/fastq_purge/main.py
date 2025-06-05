@@ -4,6 +4,8 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
+from collections import defaultdict
 from hashlib import sha256
 from importlib.metadata import version
 from itertools import repeat
@@ -11,6 +13,7 @@ from pickle import dumps
 
 import dnaio
 import multiprocess as mp
+import polars
 import psutil
 from loky import get_reusable_executor
 from multiprocess import Process, Semaphore
@@ -53,17 +56,27 @@ def parse_args() -> argparse.Namespace:
         formatter_class=ArgumentDefaultsRichHelpFormatter,
     )
     parser.add_argument(
+        "--flowcell-path",
+        type=pathlib.Path,
+        help="""Path to the flowcell directory. It is used to extract the lane information from the
+        SampleSheet.csv file, and to identify the undetermined and assigned files.
+        """,
+        default=None,
+        required=False,
+    )
+    parser.add_argument(
         "--undetermined-path",
         type=pathlib.Path,
         help="""Path to the target fastq file(s) to purge. It can be gzipped or not.
         It can be a single file or a directory. If a directory is provided,
         all files in the directory that match the pattern '*.fq*' or '*.fastq*'
-        will be used as target files. The search is non-recursive.""",
-        required=True,
+        will be used as target files. The search is recursive.""",
+        default=None,
+        required=False,
     )
     parser.add_argument(
         "--output-path",
-        type=str,
+        type=pathlib.Path,
         default=None,
         help="Path to the output fastq file",
         required=False,
@@ -76,8 +89,17 @@ def parse_args() -> argparse.Namespace:
         It can be a single file or multiple files separated by spaces, or a directory.
         If a directory is provided, all files in the directory that match the pattern
         '*.fq*' or '*.fastq*' will be used as bloom filter sources. The search is recursive.""",
-        required=True,
+        required=False,
         nargs="+",
+    )
+    parser.add_argument(
+        "--sample-sheet",
+        type=pathlib.Path,
+        default=None,
+        help="""Path to the sample sheet file. It is used to extract the sample and lane
+        information, and to match the undetermined files with the assigned files.
+        """,
+        required=False,
     )
     parser.add_argument(
         "--method",
@@ -138,6 +160,98 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_sample_sheet(sample_sheet: pathlib.Path) -> dict:
+    """
+    Parse the sample sheet file and return a dictionary of sample names and their corresponding lanes.
+
+    Args:
+        sample_sheet (pathlib.Path): Path to the sample sheet file.
+
+    Returns:
+        dict: Dictionary of sample names and their corresponding lanes.
+    """
+    # Read the sample sheet file and stores all lines in a list
+    sample_sheet = "SampleSheet.csv"
+    with open(sample_sheet) as input_file:
+        lines = input_file.readlines()
+
+    # Find the line where the FCID starts, where the actual data in CSV format starts
+    skip_lines = [i for i, line in enumerate(lines) if line.startswith("FCID")]
+    if not skip_lines:
+        _logger.error(
+            "No valid SampleSheet found! 'FCID' header not found in the file. "
+        )
+        exit(1)
+    else:
+        skip_lines = skip_lines[0]
+
+    # Write the lines to a temporary file, skipping the header lines
+    tmp = tempfile.NamedTemporaryFile()
+    with open(tmp.name, "w") as f:
+        for line in lines[skip_lines:]:
+            _ = f.write(line)
+
+    # Read the temporary file using polars and process the data
+    data = (
+        polars.read_csv(tmp.name)
+        .with_columns(polars.col("Lane").cast(polars.String).str.zfill(3))
+        .with_columns(polars.col("Lane").str.pad_start(4, "L"))
+        .with_columns(
+            [
+                polars.col("index")
+                .fill_null("")
+                .str.len_chars()
+                .alias("index1_length"),
+                polars.col("index2")
+                .fill_null("")
+                .str.len_chars()
+                .alias("index2_length"),
+            ]
+        )
+        .with_columns(
+            polars.concat_str(
+                [
+                    polars.col("Recipe"),
+                    polars.col("index1_length"),
+                    polars.col("index2_length"),
+                ],
+                separator="-",
+            ).alias("Recipe")
+        )
+    )
+
+    # Select only the lanes that need to be deduplicated
+    data = (
+        data.select(["Lane", "Sample_Project", "Sample_Name"])
+        .group_by(["Lane", "Sample_Project"])
+        .all()
+        .join(
+            data.select(["Lane", "Recipe"])
+            .unique()
+            .group_by(["Lane"])
+            .n_unique()
+            .sort("Lane")
+            .filter(polars.col("Recipe") > 1),
+            on="Lane",
+            how="semi",
+        )
+        .sort(["Lane", "Sample_Project"])
+    )
+
+    # Create a dictionary to store the sample sheet data
+    sample_sheet_dict = defaultdict(dict)
+    for lane in data.get_column("Lane").unique(maintain_order=True):
+        sample_sheet_dict.setdefault(lane, defaultdict(list))
+        for proj, id in (
+            data.filter(polars.col("Lane") == lane)
+            .select("Sample_Project", "Sample_Name")
+            .iter_rows()
+        ):
+            sample_sheet_dict[lane].setdefault(proj, []).append(id)
+
+    return sample_sheet_dict
+
+
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """
     Validate command line arguments.
@@ -147,10 +261,68 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     Returns:
         argparse.Namespace: Validated arguments.
     """
+    # Check if the flowcell path is provided and is a directory
+    if args.flowcell_path and args.flowcell_path.is_dir():
+        _logger.debug("Flowcell path provided! Deriving paths from it...")
+        args.sample_sheet = (
+            args.sample_sheet
+            or [
+                path
+                for path in args.flowcell_path.iterdir()
+                if re.match(r"^SampleSheet.(csv|txt)$", path.name)
+            ][-1]
+        )
+        args.undetermined_path = args.undetermined_path or args.flowcell_path
+        args.assigned_path = args.assigned_path or args.flowcell_path
+    elif not args.flowcell_path.is_dir():
+        _logger.error(
+            f"Flowcell path '{args.flowcell_path}' is not a valid directory! "
+            "Please provide a valid flowcell path."
+        )
+        exit(1)
+    else:
+        _logger.info("No flowcell path provided, using manually provided arguments")
 
-    def explode_path(path: pathlib.Path, recursive: bool = False) -> list[pathlib.Path]:
+    if args.sample_sheet is None or not args.sample_sheet.is_file():
+        _logger.error(
+            "No sample sheet provided or found! Please provide a valid sample sheet file."
+        )
+        exit(1)
+    elif args.undetermined_path is None or not args.undetermined_path.exists():
+        _logger.error(
+            "No undetermined path provided or found! Please provide a valid undetermined fastq file."
+        )
+        exit(1)
+    elif args.assigned_path is None or not (
+        all([x.exists() for x in args.assigned_path])
+        if isinstance(args.assigned_path, list)
+        else args.assigned_path.exists()
+    ):
+        _logger.error(
+            "No assigned path provided or found! Please provide assigned fastq file(s) or directory."
+        )
+        exit(1)
+    else:
+        _logger.debug("All paths are valid!")
+    return args
+
+
+def process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, dict]:
+    """Process and modify the command line arguments.
+    Args:
+        args (argparse.Namespace): Parsed command line arguments.
+    Returns:
+        argparse.Namespace: Processed arguments with additional information.
+    """
+
+    def explode_path_to_fastq_files(
+        path: pathlib.Path,
+        recursive: bool = False,
+        include_regex: str = None,
+        exclude_regex: str = None,
+    ) -> list[pathlib.Path]:
         """
-        Explode a path into a list of files or directories.
+        Explode a path into a list of files.
         If the path is a directory, it will return all files in the directory that match
         the pattern '*.fq*' or '*.fastq*'. If the path is a file, it will return the file itself.
 
@@ -158,21 +330,27 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
             path (pathlib.Path): Path to the target file or directory.
             recursive (bool): Whether to search recursively in the directory.
         Returns:
-            list[pathlib.Path]: List of files or directories.
+            list[pathlib.Path]: List of files.
         """
+        # Patterns for either root-only or recursive search
         patterns = ["**/*.fq*", "**/*.fastq*"] if recursive else ["*.fq*", "*.fastq*"]
+        files = []
         if path.is_dir():
-            files = []
-            for pattern in patterns:
-                files += list(pathlib.Path(path).glob(pattern))
-            return files
+            files = [f for pattern in patterns for f in path.glob(pattern)]
         elif path.is_file():
-            return [path]
+            files.append(path)
         else:
             _logger.error(f"Path '{path}' is neither a file nor a directory")
             exit(1)
+        if include_regex:
+            files = [f for f in files if re.search(include_regex, f.name)]
+        if exclude_regex:
+            files = [f for f in files if not re.search(exclude_regex, f.name)]
+        return files
 
-    def create_paired_dict(path: list[pathlib.Path]) -> dict[str, list[pathlib.Path]]:
+    def create_undetermined_paired_dict(
+        path: list[pathlib.Path],
+    ) -> dict[str, list[pathlib.Path]]:
         """
         Create a dictionary of paired files from the list of paths.
         The keys are the lane numbers and the values are tuples of paired files.
@@ -182,22 +360,30 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         Returns:
             dict[str, list[pathlib.Path]]: Dictionary of paired files.
         """
-        # Create the list of all target files
+        # Create the list of all undetermined fastq files, excluding purged files
         path = [
-            x for x in explode_path(path, recursive=False) if "purged" not in x.name
+            x
+            for x in explode_path_to_fastq_files(
+                path,
+                recursive=True,
+                include_regex="^Undetermined",
+                exclude_regex="purged",
+            )
         ]
+        # Create the patterns for the undetermined files
         patterns = sorted(
             list(
-                {
-                    tuple(([x.parent, re.sub(r"_R[12]_", "_R[12]_", x.name)]))
-                    for x in path
-                }
+                {tuple([x.parent, re.sub(r"_R[12]_", "_R[12]_", x.name)]) for x in path}
             )
         )
+        # Create a dictionary with the lane numbers as keys and the paired files as values
         path = {
-            pattern.split("_")[2]: tuple(pathlib.Path(parent).glob(f"{pattern}"))
+            re.search(r"_L[0-9]{3}_", pattern).group().strip("_"): tuple(
+                pathlib.Path(parent).glob(f"{pattern}")
+            )
             for parent, pattern in patterns
         }
+        # Sort the values in the dictionary or insert None if only one file is present
         return {
             key: tuple(sorted(list(values)))
             if len(values) == 2
@@ -205,25 +391,26 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
             for key, values in path.items()
         }
 
-    args.undetermined_path = create_paired_dict(args.undetermined_path)
+    # Extract and group the undetermined files by lane
+    args.undetermined_path = create_undetermined_paired_dict(args.undetermined_path)
+    if not args.undetermined_path:
+        _logger.error("No undetermined files found! Please provide valid paths.")
+        exit(1)
 
-    _logger.info("Undetermined files:")
+    _logger.debug("Undetermined files:")
     for lane, targets in args.undetermined_path.items():
         for target in targets:
-            _logger.info(f"    {lane}: '{target}'")
+            _logger.debug(f"    {lane}: '{target}'")
 
     # Check whether the output path exists, if not, create it
-    args.output_path = (
-        pathlib.Path(args.output_path)
-        if args.output_path
-        else pathlib.Path(
-            args.undetermined_path[list(args.undetermined_path.keys())[0]][0].parent
-        )
+    args.output_path = args.output_path or pathlib.Path(
+        args.undetermined_path[list(args.undetermined_path.keys())[0]][0].parent
     )
     if not args.output_path.is_dir():
         _logger.debug("The output path does not exist! It will be created...")
         args.output_path.mkdir(parents=True, exist_ok=True)
-    output_dict = dict()
+    # Create a dictionary to store the output paths
+    output_dict = defaultdict(tuple)
     for key, values in args.undetermined_path.items():
         output_list = []
         for input_file in values:
@@ -246,59 +433,114 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
                             input_file.with_suffix(f".purged{fq_suffix}").name
                         )
                     )
-            output_dict[key] = tuple(output_list)
+        output_dict.setdefault(key, tuple(output_list))
     args.output_path = output_dict
 
-    _logger.info("Output files:")
+    _logger.debug("Output files:")
     for lane, targets in args.output_path.items():
         for target in targets:
-            _logger.info(f"    {lane}: '{target}'")
+            _logger.debug(f"    {lane}: '{target}'")
 
-    # Create the list of all bloom sources
+    # Create the list of all assigned fastq files, excluding udetermined files
     args.assigned_path = list(
         set(
             [
                 bs
-                for assigned_file in args.assigned_path
-                for bs in explode_path(assigned_file, recursive=True)
+                for assigned_file in (
+                    args.assigned_path
+                    if isinstance(args.assigned_path, list)
+                    else [args.assigned_path]
+                )
+                for bs in explode_path_to_fastq_files(
+                    assigned_file, recursive=True, exclude_regex="Undetermined"
+                )
             ]
         )
     )
 
-    # Valiedate the bloom sources, removing unnecessary files (e.g. retain only one of the paired reads)
+    # Collect the source files, removing unnecessary files (e.g. retain only one of the read pairs)
     sources_set = set()
     clean_assigned_files = []
     for assigned_file in sorted(args.assigned_path):
         source_basename = re.sub(r"_[IR][0-9]_", "_", assigned_file.name)
         if source_basename in sources_set:
-            _logger.warning(
-                f"Ignoring '{assigned_file}' as it is either a paired or index file"
+            _logger.debug(
+                f"Ignoring '{assigned_file}' as another file with the same basename '{source_basename}' already exists"
             )
             continue
         sources_set.add(source_basename)
         clean_assigned_files.append(assigned_file)
     args.assigned_path = clean_assigned_files
 
-    assigned_dict = dict()
+    # Group the assigned files by lane
+    assigned_dict = defaultdict(list)
     for assigned_file in args.assigned_path:
         try:
             key = re.search(r"_L[0-9]{3}_", assigned_file.name).group().strip("_")
         except AttributeError:
             _logger.warning(
-                f"File '{assigned_file}' does not match the expected pattern 'L[0-9]{3}'"
+                f"File '{assigned_file}' does not match the expected pattern '_L[0-9]{{3}}_'"
             )
             continue
-        if key in assigned_dict:
-            assigned_dict[key].append(assigned_file)
         else:
-            assigned_dict[key] = [assigned_file]
+            assigned_dict.setdefault(key, []).append(assigned_file)
     args.assigned_path = assigned_dict
-    _logger.info("Assigned files:")
+
+    _logger.debug("Assigned files:")
     for key, value in args.assigned_path.items():
         for val in value:
-            _logger.info(f"    {lane}: '{val}'")
+            _logger.debug(f"    {key}: '{val}'")
 
-    return args
+    # Parse the sample sheet to get the undetermined-assigned mapping
+    selection = parse_sample_sheet(args.sample_sheet)
+    results = defaultdict(dict)
+    for key, value in selection.items():
+        results.setdefault(key, defaultdict())
+        results[key]["undetermined"] = args.undetermined_path.get(key, tuple())
+        results[key]["output"] = args.output_path.get(key, tuple())
+        results[key]["assigned"] = list()
+        for proj, ids in value.items():
+            results[key]["assigned"].append(
+                [
+                    x
+                    for x in assigned_dict.get(key, [])
+                    if any([x.name.startswith(p) for l in ids for p in l])
+                ]
+            )
+        if not results[key]["assigned"] or not results[key]["undetermined"]:
+            _logger.warning(
+                f"Lane '{key}' should undergo purging, but no undetermined or assigned reads were found! "
+                "Skipping this lane."
+            )
+            del results[key]
+            continue
+
+        _logger.info(
+            f"Lane '{key}' has {len(results[key]['undetermined'])} undetermined reads and {len(results[key]['assigned'])} assigned reads files"
+        )
+        print(results[key]["assigned"])
+        _logger.debug(
+            f"Lane '{key}' details:\n"
+            f"The following files will be purged: {', '.join([x.name for x in results[key]['undetermined']])}\n"
+            f"From reads in the following files: {', '.join([f.name for x in results[key]['assigned'] for f in x])}'"
+        )
+
+    if not results:
+        _logger.error(
+            "No lanes found for purging! Please provide valid paths or a sample sheet."
+        )
+        exit(1)
+
+    if all(
+        not results[key]["assigned"] or not results[key]["undetermined"]
+        for key in results
+    ):
+        _logger.error(
+            "No assigned or undetermined reads found! Please provide valid paths."
+        )
+        exit(1)
+
+    return (args, results)
 
 
 def memory_usage(logger, pid: int = None) -> None:
@@ -558,7 +800,7 @@ class MultiprocessingCustom:
         self.undetermined = data
         self.buffer_size = 1000000
         self.assigned = set()
-        self.log = dict()
+        self.log = defaultdict(int)
 
     def intersect_and_update(self, subset) -> int:
         """
@@ -800,7 +1042,7 @@ def main() -> None:
     _logger.setLevel(args.log_level)
 
     # Validate the command line arguments
-    args = validate_args(args)
+    args, matching_table = process_args(validate_args(args))
 
     if args.method == "approx":
         _logger.info("Using bloom filter method")
