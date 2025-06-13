@@ -78,7 +78,9 @@ def parse_args() -> argparse.Namespace:
         "--output-path",
         type=pathlib.Path,
         default=None,
-        help="Path to the output fastq file",
+        help="""Path to the output folder where the purged fastq files will be saved.
+        If not provided, the output files will be saved in the same directory as the undetermined files.
+        If the output path does not exist, it will be created.""",
         required=False,
     )
     parser.add_argument(
@@ -100,6 +102,14 @@ def parse_args() -> argparse.Namespace:
         information, and to match the undetermined files with the assigned files.
         """,
         required=False,
+    )
+    parser.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="""Keep the original undetermined fastq files after purging.
+        If this option is not set, the original files will be removed after purging,
+        while if set, the purged files will be saved with the suffix '.purged' added to the original file basename.
+        """,
     )
     parser.add_argument(
         "--method",
@@ -171,7 +181,6 @@ def parse_sample_sheet(sample_sheet: pathlib.Path) -> dict:
         dict: Dictionary of sample names and their corresponding lanes.
     """
     # Read the sample sheet file and stores all lines in a list
-    sample_sheet = "SampleSheet.csv"
     with open(sample_sheet) as input_file:
         lines = input_file.readlines()
 
@@ -263,7 +272,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """
     # Check if the flowcell path is provided and is a directory
     if args.flowcell_path and args.flowcell_path.is_dir():
-        _logger.debug("Flowcell path provided! Deriving paths from it...")
+        _logger.debug("Flowcell path provided! Validating paths...")
         args.sample_sheet = (
             args.sample_sheet
             or [
@@ -303,7 +312,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         )
         exit(1)
     else:
-        _logger.debug("All paths are valid!")
+        _logger.debug("Success! All paths are valid.")
     return args
 
 
@@ -465,7 +474,8 @@ def process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, dict]:
         source_basename = re.sub(r"_[IR][0-9]_", "_", assigned_file.name)
         if source_basename in sources_set:
             _logger.debug(
-                f"Ignoring '{assigned_file}' as another file with the same basename '{source_basename}' already exists"
+                f"Ignoring '{assigned_file.name}' as another file with the same basename "
+                f"('{re.sub(r'(_001)?.f(ast)?q(.gz)?', '', source_basename)}') was found in the same path"
             )
             continue
         sources_set.add(source_basename)
@@ -518,7 +528,6 @@ def process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, dict]:
         _logger.info(
             f"Lane '{key}' has {len(results[key]['undetermined'])} undetermined reads and {len(results[key]['assigned'])} assigned reads files"
         )
-        print(results[key]["assigned"])
         _logger.debug(
             f"Lane '{key}' details:\n"
             f"The following files will be purged: {', '.join([x.name for x in results[key]['undetermined']])}\n"
@@ -543,7 +552,7 @@ def process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, dict]:
     return (args, results)
 
 
-def memory_usage(logger, pid: int = None) -> None:
+def memory_usage(logger: logging.Logger, pid: int = None) -> None:
     """
     Print the memory usage of the current process.
 
@@ -730,14 +739,14 @@ def process_target_set(
         logger.debug(f"    {pid}: Processed {i} reads")
         tmp_set.intersection_update(undetermined_set)
         already_assigned.update(tmp_set)
-    logger.info(
+    logger.debug(
         f"Process {pid} ('{path.name}') finished yielding {len(already_assigned)} assigned reads"
     )
     return (pid, path.name, already_assigned)
 
 
 def loky_process_target_set(
-    assigned_dict: dict,
+    assigned_list: list[pathlib.Path],
     threads: int = 1,
     log_level: str = "INFO",
 ) -> set:
@@ -773,15 +782,13 @@ def loky_process_target_set(
         initargs=(undetermined_set,),
     )
     _logger.info("Purging already assigned reads...")
-    already_assigned = set()
-    for as_lane, targets in assigned_dict.items():
-        results = executor.map(
-            process_target_set,
-            targets,
-            repeat(log_level),
-        )
-        already_assigned.update(*[res[2] for res in results])
-    return already_assigned
+
+    results = executor.map(
+        process_target_set,
+        assigned_list,
+        repeat(log_level),
+    )
+    return set([x for res in results for x in res[2]])
 
 
 class CustomManager(BaseManager):
@@ -909,14 +916,14 @@ def pool_task(path, log_level="INFO") -> tuple:
                 tmp_set.clear()
         tmp_set.intersection_update(undetermined_set)
         assigned_set.update(tmp_set)
-    _logger.info(
+    _logger.debug(
         f"Process {pid} ('{path.name}') finished yielding {len(assigned_set)} already assigned reads"
     )
     return (path.name, assigned_set)
 
 
 def multiprocessing_process_target_set(
-    assigned_dict: dict,
+    assigned_list: list[pathlib.Path],
     threads: int = 1,
     log_level: str = "INFO",
     method: str = "pool",  # either "manager" or "pool"
@@ -946,42 +953,38 @@ def multiprocessing_process_target_set(
             shared_custom = manager.MultiprocessingCustom(undetermined_set)
             memory_usage(_logger)
             semaphore = Semaphore(threads)
-            for as_lane, targets in assigned_dict.items():
-                _logger.debug(
-                    f"Creating {len(targets)} child processes for lane '{as_lane}'"
+            _logger.debug(f"Creating {len(assigned_list)} child processes...")
+            processes = [
+                Process(
+                    target=manager_work,
+                    args=(shared_custom, target, semaphore, log_level),
                 )
-                processes = [
-                    Process(
-                        target=manager_work,
-                        args=(shared_custom, target, semaphore, log_level),
-                    )
-                    for target in targets
-                ]
-                _logger.debug(f"Starting {len(processes)} child processes")
-                for process in processes:
-                    process.start()
-                _logger.debug(f"Waiting for {len(processes)} child processes to finish")
-                for process in processes:
-                    process.join()
-                _logger.debug("Child process finished")
-                already_assigned.update(shared_custom.get_assigned())
-                shared_custom.clear_assigned()
+                for target in assigned_list
+            ]
+            _logger.debug(f"Starting {len(processes)} child processes")
+            for process in processes:
+                process.start()
+            _logger.debug(f"Waiting for {len(processes)} child processes to finish")
+            for process in processes:
+                process.join()
+            _logger.debug("Child process finished")
+            already_assigned.update(shared_custom.get_assigned())
+            shared_custom.clear_assigned()
     else:
         _logger.info("Using multiprocessing pool...")
         # Method 2: Using a process pool
         _logger.info("Purging already assigned reads...")
-        for as_lane, targets in assigned_dict.items():
-            _logger.debug(f"Creating {len(targets)} child processes for lane {as_lane}")
-            # create and configure the process pool
-            with Pool(processes=threads) as pool:
-                # issue tasks to the process pool
-                results = pool.map(pool_task, targets)
-            for res in results:
-                _logger.info(
-                    f"Process finished: {res[0]} with {len(res[1])} already assigned reads"
-                )
-            for res in results:
-                already_assigned.update(res[1])
+        _logger.debug(f"Creating {len(assigned_list)} child processes...")
+        # create and configure the process pool
+        with Pool(processes=threads) as pool:
+            # issue tasks to the process pool
+            results = pool.map(pool_task, assigned_list)
+        for res in results:
+            _logger.debug(
+                f"Process finished: {res[0]} with {len(res[1])} already assigned reads"
+            )
+
+        already_assigned = set([x for res in results for x in res[1]])
     return already_assigned
 
 
@@ -989,6 +992,7 @@ def write_purged_fastq(
     path_undetermined: pathlib.Path,
     path_purged: pathlib.Path,
     assigned_set: set,
+    keep_original: bool = False,
     threads: int = 1,
 ) -> None:
     """
@@ -1002,35 +1006,64 @@ def write_purged_fastq(
     """
     if path_undetermined[1] is None or path_purged[1] is None:
         _logger.info(f"Writing purged fastq file '{path_purged[0].name}'")
-        with dnaio.open(
-            path_purged[0],
-            mode="w",
-            compression_level=7,
-            open_threads=(threads + 1) // 2,
-        ) as writer:
-            with dnaio.open(
-                path_undetermined[0], open_threads=(threads + 1) // 2
-            ) as reader:
-                for record in reader:
-                    if record.name.split(" ")[0] not in assigned_set:
-                        writer.write(record)
-    else:
-        _logger.info(
-            f"Writing purged fastq files '{path_purged[0].name}' and '{path_purged[1].name}'"
-        )
-        with dnaio.open(
-            path_undetermined[0], path_undetermined[1], open_threads=(threads + 1) // 2
-        ) as reader:
+        try:
             with dnaio.open(
                 path_purged[0],
-                path_purged[1],
                 mode="w",
                 compression_level=7,
                 open_threads=(threads + 1) // 2,
             ) as writer:
-                for r1, r2 in reader:
-                    if r1.name.split(" ")[0] not in assigned_set:
-                        writer.write(r1, r2)
+                with dnaio.open(
+                    path_undetermined[0], open_threads=(threads + 1) // 2
+                ) as reader:
+                    for record in reader:
+                        if record.name.split(" ")[0] not in assigned_set:
+                            writer.write(record)
+        except RuntimeError as e:
+            _logger.error(
+                f"Error writing purged fastq file '{path_purged[0].name}': {e}"
+            )
+            exit(1)
+        else:
+            if not keep_original:
+                logging.info(
+                    f"Replacing undetermined fastq file '{path_undetermined[0].name}' "
+                )
+                path_purged[0].replace(path_undetermined[0])
+    else:
+        _logger.info(
+            f"Writing purged fastq files '{path_purged[0].name}' and '{path_purged[1].name}'"
+        )
+        try:
+            with dnaio.open(
+                path_undetermined[0],
+                path_undetermined[1],
+                open_threads=(threads + 1) // 2,
+            ) as reader:
+                with dnaio.open(
+                    path_purged[0],
+                    path_purged[1],
+                    mode="w",
+                    compression_level=7,
+                    open_threads=(threads + 1) // 2,
+                ) as writer:
+                    for r1, r2 in reader:
+                        if r1.name.split(" ")[0] not in assigned_set:
+                            writer.write(r1, r2)
+        except RuntimeError as e:
+            _logger.error(
+                f"Error writing purged fastq files '{path_purged[0].name}' and '{path_purged[1].name}': {e}"
+            )
+            exit(1)
+        else:
+            if not keep_original:
+                logging.info(
+                    f"Replacing undetermined fastq files '{path_undetermined[0].name}' and "
+                    f"'{path_undetermined[1].name}' with purged fastq files "
+                )
+                # Replace the undetermined files with the purged files
+                path_purged[0].replace(path_undetermined[0])
+                path_purged[1].replace(path_undetermined[1])
 
 
 def main() -> None:
@@ -1044,65 +1077,75 @@ def main() -> None:
     # Validate the command line arguments
     args, matching_table = process_args(validate_args(args))
 
-    if args.method == "approx":
-        _logger.info("Using bloom filter method")
-        _logger.info("Building bloom filter...")
-        # Create a bloom filter with the given parameters
-        bf = build_bloom_filter(args.undetermined_path, args.max_items, args.fpr)
-        # Log the bloom filter parameters
-        _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
-        # _logger.debug(f"Hash functions: {bf.hash_func}")
-        _logger.debug(f"Number of items: {bf.approx_items:.1f}")
+    for lane, data in matching_table.items():
+        _logger.info(f"Processing lane '{lane}'")
+        files_undetermined = [data["undetermined"]]
+        files_output = data["output"]
+        files_assigned = [x for l in data["assigned"] for x in l if x]
+        _logger.debug(f"    Undetermined files: {files_undetermined}")
+        _logger.debug(f"    Output files: {files_output}")
+        _logger.debug(f"    Assigned files: {files_assigned}")
 
-        # Process the target files and remove reads that are in the bloom filter
-        for target in args.assigned_path:
-            _logger.info(f"Processing target file '{target}'")
-            process_target_file(target, args.output_path, bf, args.threads)
-    else:
-        _logger.info("Using exact method")
-        memory_usage(_logger)
-        _logger.info("Building python set from undetermined reads...")
-        for un_lane, (un_file_1, un_file_2) in args.undetermined_path.items():
-            undetermined_set = build_undetermined_set(un_file_1)
-            undetermined_count = len(undetermined_set)
-            set_size_mb = sys.getsizeof(undetermined_set) / 1024**2
-            _logger.info(
-                f"Number of undetermined reads: {undetermined_count} ({set_size_mb:.2f} MB)"
-            )
+        if args.method == "approx":
+            _logger.info("Using bloom filter method")
+            _logger.info("Building bloom filter...")
+            # Create a bloom filter with the given parameters
+            bf = build_bloom_filter(files_undetermined, args.max_items, args.fpr)
+            # Log the bloom filter parameters
+            _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
+            # _logger.debug(f"Hash functions: {bf.hash_func}")
+            _logger.debug(f"Number of items: {bf.approx_items:.1f}")
 
+            # Process the target files and remove reads that are in the bloom filter
+            for target in files_assigned:
+                _logger.info(f"Processing target file '{target}'")
+                process_target_file(target, files_output, bf, args.threads)
+        else:
+            _logger.info("Using exact method")
             memory_usage(_logger)
-            if args.threading_method == "loky":
-                # Loky executor
-                already_assigned = loky_process_target_set(
-                    args.assigned_path,
-                    threads=args.threads,
-                    log_level=args.log_level,
-                )
-            else:
-                # Multiprocess
-                method = "pool" if args.threading_method == "mp_pool" else "manager"
-                already_assigned = multiprocessing_process_target_set(
-                    args.assigned_path,
-                    threads=args.threads,
-                    log_level=args.log_level,
-                    method=method,
-                )
-
-            _logger.info(
-                f"Found {len(already_assigned)} duplicates in the undetermined file."
-            )
-            if already_assigned:
-                write_purged_fastq(
-                    (un_file_1, un_file_2),
-                    args.output_path[un_lane],
-                    already_assigned,
-                    args.threads,
-                )
-
-            else:
+            _logger.info("Building python set from undetermined reads...")
+            for un_file_1, un_file_2 in files_undetermined:
+                undetermined_set = build_undetermined_set(un_file_1)
+                undetermined_count = len(undetermined_set)
+                set_size_mb = sys.getsizeof(undetermined_set) / 1024**2
                 _logger.info(
-                    "Found no duplicates in the undetermined reads. Exiting..."
+                    f"Number of undetermined reads: {undetermined_count} ({set_size_mb:.2f} MB)"
                 )
+
+                memory_usage(_logger)
+                if args.threading_method == "loky":
+                    # Loky executor
+                    already_assigned = loky_process_target_set(
+                        files_assigned,
+                        threads=args.threads,
+                        log_level=args.log_level,
+                    )
+                else:
+                    # Multiprocess
+                    method = "pool" if args.threading_method == "mp_pool" else "manager"
+                    already_assigned = multiprocessing_process_target_set(
+                        files_assigned,
+                        threads=args.threads,
+                        log_level=args.log_level,
+                        method=method,
+                    )
+
+                _logger.info(
+                    f"Found {len(already_assigned)} duplicates in the undetermined file."
+                )
+                if already_assigned:
+                    write_purged_fastq(
+                        (un_file_1, un_file_2),
+                        files_output,
+                        already_assigned,
+                        args.keep_original,
+                        args.threads,
+                    )
+
+                else:
+                    _logger.info(
+                        "Found no duplicates in the undetermined reads. Exiting..."
+                    )
 
     _logger.info("Done!")
 
